@@ -1,61 +1,64 @@
-name: Deploy to Amazon ECS
+name: Build, Scan & Deploy to Amazon ECS
 
 on:
   push:
     branches: ["1.31.x"]
 
 env:
-  AWS_REGION: us-west-2                   # ← change to your region
-  ECR_REPOSITORY: my-app                  # ← your ECR repo name
-  ECS_SERVICE: my-service                 # ← your ECS service
-  ECS_CLUSTER: my-cluster                 # ← your ECS cluster
-  ECS_TASK_DEFINITION: .aws/task-definition.json   # path in repo
-  CONTAINER_NAME: app                     # container name in task def
+  AWS_REGION: us-west-2                        # ← CHANGE THIS (your region)
+  ECR_REPOSITORY: my-app                       # ← your ECR repository name
+  ECS_SERVICE: my-service                      # ← your ECS service name
+  ECS_CLUSTER: my-cluster                      # ← your ECS cluster name
+  ECS_TASK_DEFINITION: .aws/task-definition.json  # ← path to task def JSON in repo
+  CONTAINER_NAME: app                          # ← container name in task def
 
 permissions:
   contents: read
-  id-token: write       # required for OIDC
+  id-token: write     # Required for OIDC
 
 jobs:
-  deploy:
-    name: Build & Deploy
+  build-scan-deploy:
+    name: Build → Scan → Deploy to ECS
     runs-on: ubuntu-latest
-    environment: production
+    environment: production   # Optional: for approvals or env-specific secrets
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials (OIDC - recommended)
-        uses: aws-actions/configure-aws-credentials@v4   # or latest v5/v6
+      - name: Configure AWS credentials via OIDC (secure)
+        uses: aws-actions/configure-aws-credentials@v6
         with:
-          role-to-assume: arn:aws:iam::123456789012:role/github-actions-ecs-deploy-role
+          role-to-assume: arn:aws:iam::YOUR_AWS_ACCOUNT_ID:role/github-actions-ecs-deploy-role   # ← CHANGE THIS
           aws-region: ${{ env.AWS_REGION }}
-          # role-session-name: GitHubActions-${{ github.run_id }}   # optional
-
-      # Alternative (if still using access keys - less secure):
-      # with:
-      #   aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
-      #   aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      #   aws-region:            ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build, tag & push Docker image to ECR
-        id: build-image
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          IMAGE_TAG: ${{ github.sha }}
-        run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          # Optional: also tag as latest (careful in prod)
-          # docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          # Optional: push latest too
-          # docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
-          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push Docker image to ECR
+        id: build-and-push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: |
+            \( {{ steps.login-ecr.outputs.registry }}/ \){{ env.ECR_REPOSITORY }}:${{ github.sha }}
+            \( {{ steps.login-ecr.outputs.registry }}/ \){{ env.ECR_REPOSITORY }}:latest   # ← comment out if you don't want :latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan image for vulnerabilities (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: \( {{ steps.login-ecr.outputs.registry }}/ \){{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          format: 'table'
+          exit-code: '1'                  # Fail build if issues found
+          ignore-unfixed: true
+          severity: 'CRITICAL,HIGH'       # Adjust thresholds as needed (can add MEDIUM/LOW)
 
       - name: Render ECS task definition with new image
         id: task-def
@@ -63,10 +66,10 @@ jobs:
         with:
           task-definition: ${{ env.ECS_TASK_DEFINITION }}
           container-name: ${{ env.CONTAINER_NAME }}
-          image: ${{ steps.build-image.outputs.image }}
+          image: \( {{ steps.login-ecr.outputs.registry }}/ \){{ env.ECR_REPOSITORY }}:${{ github.sha }}
 
-      - name: Deploy new ECS task definition
-        uses: aws-actions/amazon-ecs-deploy-task-definition@v2   # ← updated to v2
+      - name: Deploy updated task definition to ECS service
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
         with:
           task-definition: ${{ steps.task-def.outputs.task-definition }}
           service: ${{ env.ECS_SERVICE }}
